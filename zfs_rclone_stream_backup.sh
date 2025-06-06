@@ -473,7 +473,8 @@ get_current_total_remote_size() {
 # returning them in order from oldest to newest.
 # Output format: <SET_ID> <DATASET_SAFE_NAME> <APPROX_SIZE_BYTES>
 get_all_remote_sets_globally_sorted() {
-    local datasets_to_scan=(); local ds_safe; local tmp_sets_file; tmp_sets_file=$(mktemp)
+    local datasets_to_scan=(); local ds_safe
+    local temp_output_file; temp_output_file=$(mktemp)
     
     # Use provided datasets or scan for them if ALL
     for dataset_to_scan in "${SOURCE_DATASETS[@]}"; do
@@ -481,36 +482,72 @@ get_all_remote_sets_globally_sorted() {
         datasets_to_scan+=("${ds_safe}")
     done
     
+    _log_internal "PRUNING_UTIL(get_all_sets): Scanning datasets: ${datasets_to_scan[*]}"
+    
     # For each dataset, get all unique set IDs
     for ds_safe in "${datasets_to_scan[@]}"; do
         local r_path="${RCLONE_BASE_PATH_ON_REMOTE}/${ds_safe}"
         local full_r_path="${RCLONE_REMOTE_NAME}:${r_path}"
         
+        _log_internal "PRUNING_UTIL(get_all_sets): Checking ${full_r_path}"
+        
         # List all files in the dataset's remote directory
         local files_list_json; files_list_json=$(${RCLONE_CMD_BASE} lsjson "${RCLONE_GLOBAL_OPTIONS_ARRAY[@]}" "${RCLONE_LSJSON_OPTIONS_ARRAY[@]}" "${full_r_path}" 2>/dev/null)
-        if [ $? -ne 0 ]; then continue; fi
+        local lsjson_status=$?
+        if [ $lsjson_status -ne 0 ]; then 
+            _log_internal "PRUNING_UTIL(get_all_sets): lsjson failed for ${full_r_path} (status: $lsjson_status)"
+            continue
+        fi
         
-        # Process files to find sets and their sizes
-        local set_size_map=(); declare -A set_size_map
-        while read -r line; do
-            if [[ "${line}" == *".zfs.gz"* ]]; then
-                local set_id; set_id=$(get_set_id_from_filename "${line}")
+        if [ -z "${files_list_json}" ] || [ "${files_list_json}" = "null" ] || [ "${files_list_json}" = "[]" ]; then
+            _log_internal "PRUNING_UTIL(get_all_sets): No files found in ${full_r_path}"
+            continue
+        fi
+        
+        # Create temporary file for this dataset's set calculations
+        local temp_dataset_file; temp_dataset_file=$(mktemp)
+        
+        # Process each .zfs.gz file to extract set info
+        echo "${files_list_json}" | ${JQ_CMD_BASE} -r '.[] | select(.Name | endswith(".zfs.gz")) | "\(.Name) \(.Size)"' | while read -r filename filesize; do
+            if [ -n "${filename}" ] && [[ "${filesize}" =~ ^[0-9]+$ ]]; then
+                local set_id; set_id=$(get_set_id_from_filename "${filename}")
                 if [ -n "${set_id}" ]; then
-                    local size; size=$(echo "${line}" | ${JQ_CMD_BASE} -r '.Size')
-                    if [[ -v set_size_map["${set_id}"] ]]; then
-                        set_size_map["${set_id}"]=$((set_size_map["${set_id}"] + size))
-                    else
-                        set_size_map["${set_id}"]=${size}
-                    fi
+                    echo "${set_id} ${filesize}" >> "${temp_dataset_file}"
+                    _log_internal "PRUNING_UTIL(get_all_sets): Found set ${set_id} file ${filename} size ${filesize}"
                 fi
             fi
-        done < <(echo "${files_list_json}" | ${JQ_CMD_BASE} -c '.[]')
-        
-        # Output each set with dataset and size
-        for set_id in "${!set_size_map[@]}"; do
-            echo "${set_id} ${ds_safe} ${set_size_map[${set_id}]}"
         done
-    done | sort -k1 # Sort by set ID (timestamp) to get oldest first
+        
+        # Sum up sizes for each set ID and output results
+        if [ -s "${temp_dataset_file}" ]; then
+            # Group by set_id and sum sizes
+            sort "${temp_dataset_file}" | awk '
+            {
+                if ($1 in set_sizes) {
+                    set_sizes[$1] += $2
+                } else {
+                    set_sizes[$1] = $2
+                }
+            }
+            END {
+                for (set_id in set_sizes) {
+                    print set_id " '${ds_safe}' " set_sizes[set_id]
+                }
+            }' >> "${temp_output_file}"
+        fi
+        
+        rm -f "${temp_dataset_file}"
+    done
+    
+    # Sort all results by set ID (timestamp) and output
+    if [ -s "${temp_output_file}" ]; then
+        sort -k1 "${temp_output_file}"
+        _log_internal "PRUNING_UTIL(get_all_sets): Found $(wc -l < "${temp_output_file}") sets total"
+    else
+        _log_internal "PRUNING_UTIL(get_all_sets): No sets found across all datasets"
+    fi
+    
+    rm -f "${temp_output_file}"
 }
 
 # Deletes all files related to a specific backup set from remote storage.
@@ -745,11 +782,83 @@ run_backup_mode() {
     # Step 3: Per-dataset remote pruning based on set count.
     CURRENT_SCRIPT_ACTION="REMOTE_PRUNING"; if [ "$OVERALL_JOB_STATUS" != "INIT_FAILURE" ]; then
         log_and_summarize "--- Step 3: Per-Dataset Set-Count-Based Remote Cleanup ---" # (Implementation as in v1.7.3)
-        for dataset_prune in "${SOURCE_DATASETS[@]}"; do local dataset_safe_prune=$(echo "${dataset_prune}" | tr '/' '_'); local remote_dataset_dir_prune="${RCLONE_BASE_PATH_ON_REMOTE}/${dataset_safe_prune}"; local full_rclone_dataset_dir_prune="${RCLONE_REMOTE_NAME}:${remote_dataset_dir_prune}"; log "SetCountPrune: Checking dataset ${dataset_safe_prune}"; local rclone_lsf_manifests_out_stderr; local rclone_lsf_manifests_out; rclone_lsf_manifests_out=$(${RCLONE_CMD_BASE} lsf --config "${RCLONE_CONFIG_PATH}" "${RCLONE_GLOBAL_OPTIONS_ARRAY[@]}" "${RCLONE_LSJSON_OPTIONS_ARRAY[@]}" "${full_rclone_dataset_dir_prune}" 2>&1); local rclone_lsf_status=$?; if [ $rclone_lsf_status -ne 0 ]; then if [[ "$rclone_lsf_manifests_out" != *"directory not found"* ]]; then log_and_summarize "SetCountPrune ERROR: rclone lsf failed for ${full_rclone_dataset_dir_prune} (status $rclone_lsf_status). Output: $rclone_lsf_manifests_out"; OVERALL_JOB_STATUS="PARTIAL_FAILURE";fi; DATASET_STATS["${dataset_safe_prune}"]+=", Remote Sets: ErrorListing"; continue; fi; mapfile -t current_set_ids < <(echo "${rclone_lsf_manifests_out}" | grep -Eo "manifest_set-([0-9]{14})_dataset-${dataset_safe_prune}\.json$" | sed -n 's/^manifest_set-\([0-9]{14\}\)_dataset-.*/\1/p' | sort -un); local num_sets=${#current_set_ids[@]}; log "SetCountPrune: Found ${num_sets} unique SET_IDs for ${dataset_safe_prune}. Max allowed: ${MAX_BACKUP_SETS_PER_DATASET}."; if [[ -n "${DATASET_STATS[${dataset_safe_prune}]}" ]]; then DATASET_STATS["${dataset_safe_prune}"]+=", Remote Sets: ${num_sets}"; else DATASET_STATS["${dataset_safe_prune}"]="Remote Sets: ${num_sets}"; fi; local num_sets_to_delete=$((num_sets - MAX_BACKUP_SETS_PER_DATASET)); if [ ${num_sets_to_delete} -gt 0 ]; then log_and_summarize "SetCountPrune: For ${dataset_safe_prune}, deleting ${num_sets_to_delete} oldest set(s)."; for i in $(seq 0 $((num_sets_to_delete - 1))); do local set_id_to_nuke="${current_set_ids[$i]}"; delete_backup_set_files "${dataset_safe_prune}" "${set_id_to_nuke}" || { OVERALL_JOB_STATUS="PARTIAL_FAILURE"; add_to_summary "ERROR: SetCountPrune: Failed to delete set ${set_id_to_nuke} for ${dataset_safe_prune}."; }; done; else log "SetCountPrune: Dataset ${dataset_safe_prune} within set count limit."; fi; done
-
-        # Step 4: Global remote pruning based on total size.
-        log_and_summarize "--- Step 4: Global Total Size-Based Remote Cleanup ---" # (Implementation as in v1.7.3)
-        if [ "${ENABLE_TOTAL_SIZE_LIMIT_PRUNING}" = true ]; then log "GlobalSizePrune: Enabled. Max total: ${MAX_TOTAL_REMOTE_SIZE_BYTES} B."; local current_total_size_for_global_prune; current_total_size_for_global_prune=$(get_current_total_remote_size); local attempts_to_get_under_size_limit=0; local MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS=20; while [ -n "${current_total_size_for_global_prune}" ] && [[ "${current_total_size_for_global_prune}" =~ ^[0-9]+$ ]] && [ "${current_total_size_for_global_prune}" -gt "${MAX_TOTAL_REMOTE_SIZE_BYTES}" ] && [ ${attempts_to_get_under_size_limit} -lt ${MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS} ]; do log_and_summarize "GlobalSizePrune: Current ${current_total_size_for_global_prune} B > limit ${MAX_TOTAL_REMOTE_SIZE_BYTES} B. Pruning."; mapfile -t globally_sorted_sets < <(get_all_remote_sets_globally_sorted); if [ ${#globally_sorted_sets[@]} -eq 0 ]; then log_and_summarize "GlobalSizePrune WARNING: No sets to prune!"; OVERALL_JOB_STATUS="PARTIAL_FAILURE"; break; fi; local oldest_set_info="${globally_sorted_sets[0]}"; read -r oldest_set_id_global oldest_ds_safe_global oldest_set_size_approx_unused <<< "$oldest_set_info"; if [ -z "${oldest_set_id_global}" ]; then log_and_summarize "GlobalSizePrune WARNING: Could not determine oldest set."; OVERALL_JOB_STATUS="PARTIAL_FAILURE"; break; fi; log_and_summarize "GlobalSizePrune: Globally oldest SET_ID is ${oldest_set_id_global} from ${oldest_ds_safe_global} (set size ~${oldest_set_size_approx_unused} B)."; if delete_backup_set_files "${oldest_ds_safe_global}" "${oldest_set_id_global}"; then current_total_size_for_global_prune=$(get_current_total_remote_size); else log_and_summarize "GlobalSizePrune ERROR: Failed to delete set. Aborting size pruning."; OVERALL_JOB_STATUS="PARTIAL_FAILURE"; break; fi; attempts_to_get_under_size_limit=$((attempts_to_get_under_size_limit + 1)); done; if [ ${attempts_to_get_under_size_limit} -ge ${MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS} ] && [ "${current_total_size_for_global_prune}" -gt "${MAX_TOTAL_REMOTE_SIZE_BYTES}" ]; then log_and_summarize "GlobalSizePrune WARNING: Hit max attempts but still over limit."; OVERALL_JOB_STATUS="PARTIAL_FAILURE"; fi; if [[ "${current_total_size_for_global_prune}" =~ ^[0-9]+$ ]] && [ "${current_total_size_for_global_prune}" -le "${MAX_TOTAL_REMOTE_SIZE_BYTES}" ]; then log "GlobalSizePrune: Total size (${current_total_size_for_global_prune} B) within limit."; fi; else log "GlobalSizePrune: Disabled."; if [ "${ASSUME_RCLONE_BASE_PATH_DEDICATED}" = true ]; then get_current_total_remote_size >/dev/null; fi; fi
+        for dataset_prune in "${SOURCE_DATASETS[@]}"; do local dataset_safe_prune=$(echo "${dataset_prune}" | tr '/' '_'); local remote_dataset_dir_prune="${RCLONE_BASE_PATH_ON_REMOTE}/${dataset_safe_prune}"; local full_rclone_dataset_dir_prune="${RCLONE_REMOTE_NAME}:${remote_dataset_dir_prune}"; log "SetCountPrune: Checking dataset ${dataset_safe_prune}"; local rclone_lsf_manifests_out_stderr; local rclone_lsf_manifests_out; rclone_lsf_manifests_out=$(${RCLONE_CMD_BASE} lsf --config "${RCLONE_CONFIG_PATH}" "${RCLONE_GLOBAL_OPTIONS_ARRAY[@]}" "${RCLONE_LSJSON_OPTIONS_ARRAY[@]}" "${full_rclone_dataset_dir_prune}" 2>&1); local rclone_lsf_status=$?; if [ $rclone_lsf_status -ne 0 ]; then if [[ "$rclone_lsf_manifests_out" != *"directory not found"* ]]; then log_and_summarize "SetCountPrune ERROR: rclone lsf failed for ${full_rclone_dataset_dir_prune} (status $rclone_lsf_status). Output: $rclone_lsf_manifests_out"; OVERALL_JOB_STATUS="PARTIAL_FAILURE";fi; DATASET_STATS["${dataset_safe_prune}"]+=", Remote Sets: ErrorListing"; continue; fi; mapfile -t current_set_ids < <(echo "${rclone_lsf_manifests_out}" | grep -Eo "manifest_set-([0-9]{14})_dataset-${dataset_safe_prune}\.json$" | sed -n 's/^manifest_set-\([0-9]{14\}\)_dataset-.*/\1/p' | sort -un); local num_sets=${#current_set_ids[@]}; log "SetCountPrune: Found ${num_sets} unique SET_IDs for ${dataset_safe_prune}. Max allowed: ${MAX_BACKUP_SETS_PER_DATASET}."; if [[ -n "${DATASET_STATS[${dataset_safe_prune}]}" ]]; then DATASET_STATS["${dataset_safe_prune}"]+=", Remote Sets: ${num_sets}"; else DATASET_STATS["${dataset_safe_prune}"]="Remote Sets: ${num_sets}"; fi; local num_sets_to_delete=$((num_sets - MAX_BACKUP_SETS_PER_DATASET)); if [ ${num_sets_to_delete} -gt 0 ]; then log_and_summarize "SetCountPrune: For ${dataset_safe_prune}, deleting ${num_sets_to_delete} oldest set(s)."; for i in $(seq 0 $((num_sets_to_delete - 1))); do local set_id_to_nuke="${current_set_ids[$i]}"; delete_backup_set_files "${dataset_safe_prune}" "${set_id_to_nuke}" || { OVERALL_JOB_STATUS="PARTIAL_FAILURE"; add_to_summary "ERROR: SetCountPrune: Failed to delete set ${set_id_to_nuke} for ${dataset_safe_prune}."; }; done; else log "SetCountPrune: Dataset ${dataset_safe_prune} within set count limit."; fi; done        # Step 4: Global remote pruning based on total size.
+        log_and_summarize "--- Step 4: Global Total Size-Based Remote Cleanup ---"
+        
+        if [ "${ENABLE_TOTAL_SIZE_LIMIT_PRUNING}" = true ]; then
+            log "GlobalSizePrune: Enabled. Max total: ${MAX_TOTAL_REMOTE_SIZE_BYTES} B."
+            
+            local current_total_size_for_global_prune
+            current_total_size_for_global_prune=$(get_current_total_remote_size)
+            local attempts_to_get_under_size_limit=0
+            local MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS=20
+            
+            while [ -n "${current_total_size_for_global_prune}" ] && \
+                  [[ "${current_total_size_for_global_prune}" =~ ^[0-9]+$ ]] && \
+                  [ "${current_total_size_for_global_prune}" -gt "${MAX_TOTAL_REMOTE_SIZE_BYTES}" ] && \
+                  [ ${attempts_to_get_under_size_limit} -lt ${MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS} ]; do
+                
+                log_and_summarize "GlobalSizePrune: Current ${current_total_size_for_global_prune} B > limit ${MAX_TOTAL_REMOTE_SIZE_BYTES} B. Pruning."
+                
+                # Get all sets sorted by age
+                mapfile -t globally_sorted_sets < <(get_all_remote_sets_globally_sorted)
+                
+                # Debug: show what sets were found
+                _log_internal "GlobalSizePrune: Found ${#globally_sorted_sets[@]} sets across all datasets"
+                for debug_set in "${globally_sorted_sets[@]}"; do
+                    _log_internal "GlobalSizePrune: Available set: ${debug_set}"
+                done
+                
+                if [ ${#globally_sorted_sets[@]} -eq 0 ]; then
+                    log_and_summarize "GlobalSizePrune WARNING: No sets to prune!"
+                    OVERALL_JOB_STATUS="PARTIAL_FAILURE"
+                    break
+                fi
+                
+                # Get the oldest set
+                local oldest_set_info="${globally_sorted_sets[0]}"
+                local oldest_set_id_global oldest_ds_safe_global oldest_set_size_approx_unused
+                read -r oldest_set_id_global oldest_ds_safe_global oldest_set_size_approx_unused <<< "${oldest_set_info}"
+                
+                if [ -z "${oldest_set_id_global}" ]; then
+                    log_and_summarize "GlobalSizePrune WARNING: Could not determine oldest set from: '${oldest_set_info}'"
+                    OVERALL_JOB_STATUS="PARTIAL_FAILURE"
+                    break
+                fi
+                
+                log_and_summarize "GlobalSizePrune: Globally oldest SET_ID is ${oldest_set_id_global} from ${oldest_ds_safe_global} (set size ~${oldest_set_size_approx_unused} B)."
+                
+                # Delete the oldest set
+                if delete_backup_set_files "${oldest_ds_safe_global}" "${oldest_set_id_global}"; then
+                    log "GlobalSizePrune: Successfully deleted set ${oldest_set_id_global}, recalculating total size..."
+                    current_total_size_for_global_prune=$(get_current_total_remote_size)
+                    log "GlobalSizePrune: New total size: ${current_total_size_for_global_prune} B"
+                else
+                    log_and_summarize "GlobalSizePrune ERROR: Failed to delete set. Aborting size pruning."
+                    OVERALL_JOB_STATUS="PARTIAL_FAILURE"
+                    break
+                fi
+                
+                attempts_to_get_under_size_limit=$((attempts_to_get_under_size_limit + 1))
+            done
+            
+            # Check final status
+            if [ ${attempts_to_get_under_size_limit} -ge ${MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS} ] && \
+               [ "${current_total_size_for_global_prune}" -gt "${MAX_TOTAL_REMOTE_SIZE_BYTES}" ]; then
+                log_and_summarize "GlobalSizePrune WARNING: Hit max attempts (${MAX_GLOBAL_SIZE_PRUNE_ATTEMPTS}) but still over limit."
+                OVERALL_JOB_STATUS="PARTIAL_FAILURE"
+            fi
+            
+            if [[ "${current_total_size_for_global_prune}" =~ ^[0-9]+$ ]] && \
+               [ "${current_total_size_for_global_prune}" -le "${MAX_TOTAL_REMOTE_SIZE_BYTES}" ]; then
+                log "GlobalSizePrune: Total size (${current_total_size_for_global_prune} B) now within limit."
+            fi
+        else
+            log "GlobalSizePrune: Disabled."
+            if [ "${ASSUME_RCLONE_BASE_PATH_DEDICATED}" = true ]; then
+                get_current_total_remote_size >/dev/null
+            fi
+        fi
     fi
     if [[ "$OVERALL_JOB_STATUS" == "PENDING" ]]; then OVERALL_JOB_STATUS="SUCCESS"; fi
 
